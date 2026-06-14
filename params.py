@@ -169,6 +169,9 @@ class DotsTtsParams:
     speaker: str
     instruct: str
     output_path: str
+    num_steps: int
+    guidance_scale: float
+    speaker_scale: float
     runtime: RuntimeOptions
 
     def to_namespace(self) -> Namespace:
@@ -179,6 +182,9 @@ class DotsTtsParams:
             speaker=self.speaker,
             instruct=self.instruct,
             output_path=self.output_path,
+            num_steps=self.num_steps,
+            guidance_scale=self.guidance_scale,
+            speaker_scale=self.speaker_scale,
             logging_dir=self.runtime.logging_dir,
             device=self.runtime.device,
             attn_implementation=self.runtime.attn_implementation,
@@ -188,22 +194,28 @@ class DotsTtsParams:
 @dataclass
 class DotsTtsVoiceCloneParams:
     common: CommonTaskArgs
-    ref_audio_path: str
-    ref_text: str
+    prompt_audio_path: str
+    prompt_text: str
     init_model_path: str
     language: str
     output_path: str
     text: str
+    num_steps: int
+    guidance_scale: float
+    speaker_scale: float
     runtime: RuntimeOptions
 
     def to_namespace(self) -> Namespace:
         return Namespace(
-            ref_audio_path=self.ref_audio_path,
-            ref_text=self.ref_text,
+            prompt_audio_path=self.prompt_audio_path,
+            prompt_text=self.prompt_text,
             init_model_path=self.init_model_path,
             language=self.language,
             output_path=self.output_path,
             text=self.text,
+            num_steps=self.num_steps,
+            guidance_scale=self.guidance_scale,
+            speaker_scale=self.speaker_scale,
             logging_dir=self.runtime.logging_dir,
             device=self.runtime.device,
             attn_implementation=self.runtime.attn_implementation,
@@ -245,6 +257,9 @@ def load_tts_params(path: str | Path) -> DotsTtsParams:
         speaker=args.speaker or "",
         instruct=params.model_param_str("voicePrompt", "") or "",
         output_path=args.output_path,
+        num_steps=int(params.model_param("numSteps", 10) or 10),
+        guidance_scale=float(params.model_param("guidanceScale", "1.2") or 1.2),
+        speaker_scale=float(params.model_param("speakerScale", "1.5") or 1.5),
         runtime=_normalize_runtime(params.runtime),
     )
 
@@ -255,11 +270,14 @@ def load_voice_clone_params(path: str | Path) -> DotsTtsVoiceCloneParams:
 
     return DotsTtsVoiceCloneParams(
         common=args.common,
-        ref_audio_path=args.ref_audio_path,
-        ref_text=args.ref_text or "",
+        prompt_audio_path=args.ref_audio_path,
+        prompt_text=args.ref_text or "",
         init_model_path=_resolve_dots_tts_training_model_path(params),
         language=args.language or "Auto",
         output_path=args.output_path,
         text=args.text,
+        num_steps=int(params.model_param("numSteps", 10) or 10),
+        guidance_scale=float(params.model_param("guidanceScale", "1.2") or 1.2),
+        speaker_scale=float(params.model_param("speakerScale", "1.5") or 1.5),
         runtime=_normalize_runtime(params.runtime),
     )
