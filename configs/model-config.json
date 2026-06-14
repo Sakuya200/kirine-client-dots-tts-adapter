@@ -4,7 +4,7 @@
       "baseModel": "dots_tts",
       "modelName": "Dots.TTS",
       "modelVersion": "2B",
-      "downloadType": "HF-Like",
+      "downloadType": "Custom",
       "requiredModelNameList": ["dots_tts"],
       "requiredModelRepoIdList": [],
       "supportedDevices": ["cpu", "cuda"],

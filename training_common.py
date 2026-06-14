@@ -1,66 +1,181 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
+import torch
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from transformers import get_cosine_schedule_with_warmup
 
-from dots_tts.dataset import DotsTtsDataset
+from dots_tts.data.collator import PadCollator
+from dots_tts.training import losses as loss_ops
 
 
-@dataclass
-class TrainingRuntimeOptions:
-    """Options controlling accelerator and model loading configuration."""
-
-    is_cpu: bool
-    accelerator_kwargs: dict[str, Any]
-    model_load_kwargs: dict[str, Any]
-    mode_label: str
+# ---------------------------------------------------------------------------
+# Training State
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class TrainingPipelineContext:
+class TrainProgress:
+    """Minimal progress counters (mirrors dots_tts.training.utils.TrainProgress)."""
+
+    global_step: int = 0
+    epoch: int = 0
+    total_tokens: int = 0
+    audio_tokens: int = 0
+    text_tokens: int = 0
+
+
+@dataclass
+class TrainingContext:
     """All objects created during training pipeline initialization."""
 
-    runtime: TrainingRuntimeOptions
-    accelerator: Any
-    model: Any  # DotsTtsModel / DotsTtsCore
-    optimizer: Any
-    scheduler: Any | None
-    train_dataloader: Any
-    train_data: Any  # DotsTtsDataset
+    accelerator: Accelerator
+    model: Any  # wrapped DotsTtsModel
+    unwrapped_model: Any  # unwrapped DotsTtsModel
+    tokenizer: Any
+    optimizer: AdamW
+    scheduler: Any
+    train_loader: DataLoader
+    progress: TrainProgress = field(default_factory=TrainProgress)
+    max_train_steps: int = 0
+    gradient_accumulation_steps: int = 1
+    sample_rate: int = 48000
 
 
-def is_cpu_device(device: str) -> bool:
-    """Return True when ``device`` indicates CPU-only execution."""
-    return (device or "").strip().lower() in {"cpu", ""}
+# ---------------------------------------------------------------------------
+# CLI Helpers
+# ---------------------------------------------------------------------------
 
 
 def add_common_training_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Register CLI arguments shared by all training modes."""
+    """Register the ``--params-file`` argument shared by all training entry points."""
     parser.add_argument(
-        "--params-file", dest="params_file", type=str, required=True,
+        "--params-file",
+        dest="params_file",
+        type=str,
+        required=True,
         help="Path to a JSON params file produced by the kirine-client UI.",
     )
     return parser
 
 
-def enable_gradient_checkpointing(model: Any) -> None:
-    """Enable gradient checkpointing on the model if supported.
+# ---------------------------------------------------------------------------
+# Optimizer & Scheduler
+# ---------------------------------------------------------------------------
 
-    For dots_tts, this applies to the internal LLM backbone (Qwen2).
+
+def build_optimizer(
+    model: torch.nn.Module,
+    learning_rate: float = 2e-5,
+    weight_decay: float = 0.1,
+) -> AdamW:
+    """Build an AdamW optimizer that only optimizes parameters requiring gradients."""
+    return AdamW(
+        (p for p in model.parameters() if p.requires_grad),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+
+
+def build_scheduler(
+    optimizer: AdamW,
+    num_warmup_steps: int,
+    num_training_steps: int,
+) -> Any:
+    """Build a cosine learning-rate scheduler with linear warmup."""
+    return get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+    )
+
+
+# ---------------------------------------------------------------------------
+# DataLoader
+# ---------------------------------------------------------------------------
+
+
+def build_train_dataloader(
+    dataset: torch.utils.data.Dataset,
+    tokenizer: Any,
+    *,
+    batch_size: int = 1,
+    num_workers: int = 0,
+) -> DataLoader:
+    """Build a :class:`DataLoader` with the official dots.tts :class:`PadCollator`.
+
+    The ``dataset`` must yield items compatible with ``PadCollator``
+    (i.e. dicts with ``input_ids``, ``labels``, ``loss_mask``, ``sample``,
+    ``sample_length``, ``num_text_tokens``, ``num_audio_tokens``, ``fid``).
     """
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-    elif hasattr(model, "enable_gradient_checkpointing"):
-        model.enable_gradient_checkpointing()
+    return DataLoader(
+        dataset,
+        batch_size=int(batch_size),
+        shuffle=True,
+        collate_fn=PadCollator(tokenizer),
+        num_workers=int(num_workers),
+        pin_memory=True,
+        drop_last=False,
+    )
 
 
-def disable_use_cache_for_training(model: Any) -> None:
-    """Disable KV-cache for the internal LLM during training."""
+# ---------------------------------------------------------------------------
+# Accelerator
+# ---------------------------------------------------------------------------
+
+
+def build_accelerator(
+    *,
+    gradient_accumulation_steps: int = 1,
+    output_dir: str = "",
+    mixed_precision: str = "no",
+    cpu: bool = False,
+    max_checkpoints_to_keep: int = 3,
+) -> Accelerator:
+    """Build an HF :class:`Accelerator` for training.
+
+    Args:
+        gradient_accumulation_steps: Number of steps to accumulate before
+            an optimizer step.
+        output_dir: Directory for TensorBoard logs and checkpoints.
+        mixed_precision: ``"bf16"``, ``"fp16"``, or ``"no"``.
+        cpu: If ``True``, runs entirely on CPU.
+        max_checkpoints_to_keep: Max recent checkpoints to retain on disk.
+    """
+    if cpu:
+        mixed_precision = "no"
+
+    project_config = ProjectConfiguration(
+        project_dir=output_dir,
+        total_limit=int(max_checkpoints_to_keep),
+    )
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+
+    return Accelerator(
+        kwargs_handlers=[ddp_kwargs],
+        gradient_accumulation_steps=int(gradient_accumulation_steps),
+        mixed_precision=mixed_precision,
+        log_with="tensorboard",
+        project_config=project_config,
+        step_scheduler_with_optimizer=False,
+        cpu=cpu,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gradient Checkpointing (LLM backbone)
+# ---------------------------------------------------------------------------
+
+
+def disable_use_cache_for_training(model: torch.nn.Module) -> None:
+    """Disable KV-cache in the underlying LLM backbone during training."""
     core = getattr(model, "core", None)
     if core is None:
         return
@@ -71,144 +186,36 @@ def disable_use_cache_for_training(model: Any) -> None:
             config.use_cache = False
 
 
-def load_training_dependencies() -> SimpleNamespace:
-    """Lazy-load heavy training dependencies.
+def enable_gradient_checkpointing(model: torch.nn.Module) -> None:
+    """Enable gradient checkpointing if supported by the model."""
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
 
-    Returns a namespace with ``torch``, ``Accelerator``, ``AdamW``,
-    and the installed ``dots_tts`` package.
+
+# ---------------------------------------------------------------------------
+# Loss helpers (delegate to official dots_tts.training.losses)
+# ---------------------------------------------------------------------------
+
+
+def compute_loss(
+    loss_terms: dict[str, Any],
+    global_normalizers: dict[str, float],
+    ddp_world_size: int = 1,
+    gradient_accumulation_steps: int = 1,
+) -> torch.Tensor:
+    """Compute the training loss from model outputs.
+
+    Delegates to :func:`dots_tts.training.losses.compute_gradient_loss`.
     """
-    import torch
-    from accelerate import Accelerator
+    from dots_tts.config import loss as loss_config_module
 
-    deps = SimpleNamespace(
-        torch=torch,
-        Accelerator=Accelerator,
+    # Use a minimal loss config — only total loss matters for
+    # kirine-client fine-tuning.
+    loss_config = loss_config_module.LossConfig()
+    return loss_ops.compute_gradient_loss(
+        loss_terms,
+        global_normalizers=global_normalizers,
+        loss_config=loss_config,
+        ddp_world_size=int(ddp_world_size),
+        gradient_accumulation_steps=int(gradient_accumulation_steps),
     )
-    # Best-effort: import AdamW from transformers if available
-    try:
-        from torch.optim import AdamW
-        deps.AdamW = AdamW
-    except ImportError:
-        from transformers import AdamW
-        deps.AdamW = AdamW
-
-    return deps
-
-
-def build_train_dataloader(
-    args: argparse.Namespace,
-    *,
-    manifest_path: str | None = None,
-) -> tuple[DotsTtsDataset, DataLoader]:
-    """Build a :class:`DataLoader` from a JSONL training manifest.
-
-    The manifest path is resolved from ``args.train_manifest`` or from the
-    ``manifest_path`` keyword argument.
-
-    Returns ``(dataset, dataloader)``.
-    """
-    resolved_manifest = Path(
-        manifest_path or getattr(args, "train_manifest", "")
-    ).expanduser().resolve()
-
-    if not resolved_manifest.exists():
-        raise FileNotFoundError(
-            f"Training manifest not found: {resolved_manifest}"
-        )
-
-    dataset = DotsTtsDataset(str(resolved_manifest))
-    dataloader = DataLoader(
-        dataset,
-        batch_size=int(getattr(args, "batch_size", None) or 1),
-        shuffle=True,
-        collate_fn=DotsTtsDataset.collate_fn,
-        num_workers=0,
-        pin_memory=False,
-    )
-    return dataset, dataloader
-
-
-def build_runtime_options(
-    args: argparse.Namespace,
-    torch_module: Any,
-) -> TrainingRuntimeOptions:
-    """Build :class:`TrainingRuntimeOptions` from CLI args."""
-    mixed_precision = (getattr(args, "mixed_precision", None) or "bf16").strip()
-    gradient_accumulation_steps = int(
-        getattr(args, "gradient_accumulation_steps", None) or 1
-    )
-    logging_dir = getattr(args, "logging_dir", None)
-
-    accelerator_kwargs: dict[str, Any] = {
-        "gradient_accumulation_steps": gradient_accumulation_steps,
-        "log_with": "tensorboard",
-    }
-    if logging_dir:
-        accelerator_kwargs["project_dir"] = logging_dir
-
-    if is_cpu_device(getattr(args, "device", "cpu")):
-        return TrainingRuntimeOptions(
-            is_cpu=True,
-            accelerator_kwargs={
-                **accelerator_kwargs,
-                "mixed_precision": "no",
-                "cpu": True,
-            },
-            model_load_kwargs={
-                "precision": "float32",
-            },
-            mode_label="full fine-tune (CPU)",
-        )
-
-    return TrainingRuntimeOptions(
-        is_cpu=False,
-        accelerator_kwargs={
-            **accelerator_kwargs,
-            "mixed_precision": mixed_precision,
-        },
-        model_load_kwargs={
-            "precision": "bfloat16",
-        },
-        mode_label="full fine-tune",
-    )
-
-
-def build_optimizer(
-    model: Any,
-    args: argparse.Namespace,
-    deps: SimpleNamespace,
-) -> Any:
-    """Build an AdamW optimizer for training."""
-    learning_rate = float(getattr(args, "learning_rate", None) or 2e-5)
-    weight_decay = float(getattr(args, "weight_decay", None) or 0.1)
-    return deps.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-
-
-def build_scheduler(
-    optimizer: Any,
-    args: argparse.Namespace,
-    num_training_steps: int,
-) -> Any | None:
-    """Build a learning rate scheduler with warmup."""
-    warmup_steps = getattr(args, "warmup_steps", None)
-    warmup_ratio = getattr(args, "warmup_ratio", None)
-
-    if warmup_steps is not None and int(warmup_steps) > 0:
-        num_warmup_steps = int(warmup_steps)
-    elif warmup_ratio is not None:
-        num_warmup_steps = int(float(warmup_ratio) * num_training_steps)
-    else:
-        num_warmup_steps = 0
-
-    import torch
-    from torch.optim.lr_scheduler import LambdaLR
-
-    def lr_lambda(current_step: int) -> float:
-        if current_step < num_warmup_steps and num_warmup_steps > 0:
-            return float(current_step) / float(max(num_warmup_steps, 1))
-        progress = float(current_step - num_warmup_steps) / float(
-            max(num_training_steps - num_warmup_steps, 1)
-        )
-        return max(0.0, 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159)).item()))
-
-    return LambdaLR(optimizer, lr_lambda)

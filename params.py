@@ -31,6 +31,7 @@ class DotsTtsTrainingParams:
             init_model_path=self.init_model_path,
             output_model_path=self.output_model_path,
             output_jsonl=self.output_jsonl,
+            input_jsonl=self.input_jsonl,
             logging_dir=self.runtime.logging_dir,
             batch_size=self.batch_size,
             lr=self.lr,
@@ -40,6 +41,9 @@ class DotsTtsTrainingParams:
             enable_gradient_checkpointing=self.enable_gradient_checkpointing,
             device=self.runtime.device,
             attn_implementation=self.runtime.attn_implementation,
+            warmup_steps=100,
+            gradient_clip_norm=1.0,
+            log_interval=10,
         )
 def _resolve_locator_candidate(
     common: CommonTaskArgs,

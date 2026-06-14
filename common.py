@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -9,35 +8,20 @@ import soundfile as sf
 import torch
 
 
-def current_python_executable() -> str:
-    """Return the path to the current Python interpreter."""
-    return sys.executable
+def ensure_src_root_on_path() -> None:
+    """Ensure the installed ``dots_tts`` Python package can be imported.
 
-
-def run_subprocess(
-    cmd: list[str],
-    *,
-    cwd: str | Path | None = None,
-) -> None:
-    """Run a subprocess command, raising on failure."""
-    print(f"[dots_tts] Running: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True, cwd=str(cwd) if cwd else None)
-
-
-def resolve_model_path(
-    base_model_path: str,
-    model_name: str,
-) -> str:
-    """Resolve a model path to a local directory or HuggingFace repo id.
-
-    If ``base_model_path`` points to an existing directory containing
-    ``model_name``, return that local path. Otherwise return the HF id.
+    The official dots.tts library is a dependency installed in the venv.
+    This function is a no-op when the package is already importable.
     """
-    candidate = Path(base_model_path).expanduser().resolve() / model_name
-    if candidate.exists():
-        return str(candidate)
-    # Fall back to HuggingFace repo id pattern
-    return f"rednote-hilab/{model_name}"
+    try:
+        import dots_tts  # noqa: F401
+    except ImportError:
+        raise ImportError(
+            "dots_tts Python package is not installed. "
+            "Please ensure it is installed in your environment "
+            "(e.g. via 'pip install -e <dots.tts repo>')."
+        ) from None
 
 
 def load_runtime(
@@ -47,17 +31,19 @@ def load_runtime(
     optimize: bool = False,
     max_generate_length: int = 500,
 ) -> Any:
-    """Load a :class:`dots_tts.runtime.DotsTtsRuntime` from a pretrained path.
+    """Load a :class:`dots_tts.runtime.DotsTtsRuntime` for inference.
+
+    This wraps the official :meth:`DotsTtsRuntime.from_pretrained` constructor.
 
     Args:
-        model_path: Local directory or HuggingFace repo id
-            (e.g. ``"rednote-hilab/dots.tts-soar"``).
-        precision: One of ``"bfloat16"``, ``"float32"``, ``"float16"``.
+        model_path: Local directory containing a pretrained checkpoint
+            (e.g. ``"<models>/dots.tts-soar"``).
+        precision: ``"bfloat16"``, ``"float32"``, or ``"float16"``.
         optimize: Enable ``torch.compile`` acceleration.
-        max_generate_length: Maximum audio patch count for generation.
+        max_generate_length: Maximum audio patch count (≈audio length).
 
     Returns:
-        An initialized :class:`DotsTtsRuntime` instance.
+        An initialized :class:`DotsTtsRuntime` ready for ``generate()`` calls.
     """
     from dots_tts.runtime import DotsTtsRuntime
 
@@ -75,18 +61,49 @@ def load_runtime(
     return runtime
 
 
+def load_model_for_training(
+    model_path: str,
+) -> tuple[Any, Any]:
+    """Load a :class:`dots_tts.models.dots_tts.model.DotsTtsModel` for training.
+
+    Returns ``(model, tokenizer)`` where ``model`` is the pretrained
+    :class:`DotsTtsModel` (in eval mode, on CPU) and ``tokenizer`` is the
+    model's tokenizer.
+
+    Args:
+        model_path: Local directory containing a pretrained checkpoint
+            (e.g. ``"<models>/dots.tts-base"``).
+    """
+    from dots_tts.models.dots_tts.model import DotsTtsModel
+
+    resolved = Path(model_path).expanduser().resolve()
+    print(f"[dots_tts] Loading training model from: {resolved}")
+
+    model = DotsTtsModel.from_pretrained(str(resolved))
+    tokenizer = model.tokenizer
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(
+        p.numel() for p in model.parameters() if p.requires_grad
+    )
+    print(f"[dots_tts] Model loaded.")
+    print(f"[dots_tts]   Total params: {total_params:,}")
+    print(f"[dots_tts]   Trainable params: {trainable_params:,}")
+    print(f"[dots_tts]   Sample rate: {model.config.vocoder.sample_rate}")
+    return model, tokenizer
+
+
 def save_generated_audio(
     output_path: str,
     audio: torch.Tensor,
     sample_rate: int,
 ) -> None:
-    """Save generated audio tensor to a WAV file.
+    """Save an audio tensor to a WAV file.
 
     Args:
-        output_path: Destination ``.wav`` path.
-        audio: Audio waveform tensor (any shape — will be squeezed and
-            moved to CPU float).
-        sample_rate: Sample rate in Hz (typically 48000 for dots_tts).
+        output_path: Destination ``.wav`` file path.
+        audio: Audio waveform tensor (any shape — squeezed to 1-D).
+        sample_rate: Sample rate in Hz.
     """
     waveform = audio.detach().float().cpu().squeeze().numpy()
     out = Path(output_path).expanduser().resolve()
@@ -97,3 +114,13 @@ def save_generated_audio(
         f"[dots_tts] Audio saved: {out} "
         f"({waveform.shape[-1]} samples, {duration_s:.2f}s @ {sample_rate} Hz)"
     )
+
+
+def detect_device() -> str:
+    """Return the best available torch device string.
+
+    Returns ``"cuda"`` if CUDA is available, otherwise ``"cpu"``.
+    """
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"

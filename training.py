@@ -2,279 +2,405 @@ from __future__ import annotations
 
 import argparse
 import shutil
-from types import SimpleNamespace
+import time
+from pathlib import Path
 from typing import Any
+
+import torch
+from accelerate import Accelerator
 
 from dots_tts import ensure_src_root_on_path
 
 ensure_src_root_on_path()
 
-from dots_tts.common import load_runtime  # noqa: E402
-from dots_tts.dataset import DotsTtsDataset  # noqa: E402
+from dots_tts.common import load_model_for_training  # noqa: E402
+from dots_tts.dataset import DotsTtsInMemoryDataset  # noqa: E402
 from dots_tts.params import load_training_params  # noqa: E402
 from dots_tts.training_common import (  # noqa: E402
-    TrainingPipelineContext,
+    TrainProgress,
     add_common_training_args,
+    build_accelerator,
     build_optimizer,
-    build_runtime_options,
     build_scheduler,
     build_train_dataloader,
+    compute_loss,
     disable_use_cache_for_training,
     enable_gradient_checkpointing,
-    load_training_dependencies,
-)
+)  # noqa: E402
 
 CHECKPOINT_MAX_SHARD_SIZE = "1GB"
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments for the training script."""
     parser = argparse.ArgumentParser(
-        description="Run dots_tts inline fine-tuning.",
+        description="Run dots_tts fine-tuning via kirine-client.",
     )
     parser = add_common_training_args(parser)
-    parser.add_argument(
-        "--init-model-path", dest="init_model_path", type=str, required=True,
-        help="Path to pretrained dots_tts model checkpoint.",
-    )
-    parser.add_argument(
-        "--output-model-path", dest="output_model_path", type=str, required=True,
-        help="Directory where fine-tuned checkpoints will be saved.",
-    )
-    parser.add_argument(
-        "--train-manifest", dest="train_manifest", type=str, required=True,
-        help="Path to a JSONL training manifest file.",
-    )
-    parser.add_argument(
-        "--num-epochs", dest="num_epochs", type=int, default=5,
-        help="Number of training epochs (default: 5).",
-    )
-    parser.add_argument(
-        "--batch-size", dest="batch_size", type=int, default=1,
-        help="Batch size per device (default: 1).",
-    )
-    parser.add_argument(
-        "--learning-rate", dest="learning_rate", type=float, default=2e-5,
-        help="Learning rate (default: 2e-5).",
-    )
-    parser.add_argument(
-        "--weight-decay", dest="weight_decay", type=float, default=0.1,
-        help="Weight decay (default: 0.1).",
-    )
-    parser.add_argument(
-        "--warmup-steps", dest="warmup_steps", type=int, default=100,
-        help="Number of warmup steps (default: 100).",
-    )
-    parser.add_argument(
-        "--gradient-accumulation-steps", dest="gradient_accumulation_steps",
-        type=int, default=1,
-        help="Gradient accumulation steps (default: 1).",
-    )
-    parser.add_argument(
-        "--mixed-precision", dest="mixed_precision", type=str, default="bf16",
-        help="Mixed precision mode: 'no', 'fp16', 'bf16' (default: 'bf16').",
-    )
-    parser.add_argument(
-        "--device", dest="device", type=str, default="cuda",
-        help="Device: 'cuda', 'cpu' (default: 'cuda').",
-    )
-    parser.add_argument(
-        "--logging-dir", dest="logging_dir", type=str, default=None,
-        help="TensorBoard logging directory.",
-    )
-    parser.add_argument(
-        "--enable-gradient-checkpointing", dest="enable_gradient_checkpointing",
-        action="store_true", default=False,
-        help="Enable gradient checkpointing to save memory.",
-    )
-    parser.add_argument(
-        "--gradient-clip-norm", dest="gradient_clip_norm", type=float, default=1.0,
-        help="Max gradient norm for clipping (default: 1.0).",
-    )
     return parser.parse_args(argv)
 
 
-def save_training_checkpoint(
-    args: argparse.Namespace,
-    accelerator: Any,
-    model: Any,
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+
+
+def _save_training_checkpoint(
+    *,
+    accelerator: Accelerator,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    output_dir: str,
     epoch: int,
+    global_step: int,
 ) -> None:
-    """Save a fine-tuned model checkpoint using the HuggingFace Hub utility."""
+    """Save a fine-tuned checkpoint using the model's native ``save_pretrained``."""
+    if not accelerator.is_main_process:
+        return
+
     from huggingface_hub import save_torch_state_dict
 
-    output_dir = f"{args.output_model_path}/checkpoint-epoch-{epoch}"
+    save_dir = Path(output_dir) / f"checkpoint-epoch-{epoch:03d}-step-{global_step:08d}"
+    tmp_dir = save_dir.with_name(f"{save_dir.name}.tmp")
+    model_dir = tmp_dir / "model"
 
-    # Copy config files from the initial model path.
-    shutil.copytree(args.init_model_path, output_dir, dirs_exist_ok=True)
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
 
-    unwrapped_model = accelerator.unwrap_model(model)
-    state_dict = {}
-    for key, value in unwrapped_model.state_dict().items():
-        state_dict[key] = value.detach().to("cpu")
+    try:
+        unwrapped = accelerator.unwrap_model(model)
+        unwrapped.save_pretrained(str(model_dir))
 
-    save_torch_state_dict(
-        state_dict,
-        output_dir,
-        max_shard_size=CHECKPOINT_MAX_SHARD_SIZE,
-        safe_serialization=True,
-        is_main_process=accelerator.is_main_process,
-        shared_tensors_to_discard=getattr(
-            unwrapped_model, "_tied_weights_keys", None
-        ),
-    )
+        state_dict = {}
+        for key, value in unwrapped.state_dict().items():
+            state_dict[key] = value.detach().cpu()
 
-
-def initialize_training_pipeline(
-    args: argparse.Namespace,
-    dependencies: SimpleNamespace | None = None,
-) -> TrainingPipelineContext:
-    """Initialize all objects needed for the training loop.
-
-    Loads the pretrained dots_tts model, wraps it with HF Accelerator,
-    builds the DataLoader, optimizer, and scheduler.
-    """
-    deps = dependencies or load_training_dependencies()
-    runtime = build_runtime_options(args, deps.torch)
-    accelerator = deps.Accelerator(**runtime.accelerator_kwargs)
-
-    # Load the dots_tts runtime and extract its internal core/model.
-    dots_runtime = load_runtime(
-        args.init_model_path,
-        precision=runtime.model_load_kwargs.get("precision", "bfloat16"),
-    )
-
-    # Access the internal model for training.
-    # DotsTtsRuntime wraps a DotsTtsModel which holds the core.
-    model: Any = getattr(dots_runtime, "model", None)
-    if model is None:
-        raise AttributeError(
-            "DotsTtsRuntime does not expose a 'model' attribute. "
-            "Cannot extract model for training."
+        save_torch_state_dict(
+            state_dict,
+            str(model_dir),
+            max_shard_size=CHECKPOINT_MAX_SHARD_SIZE,
+            safe_serialization=True,
+            is_main_process=accelerator.is_main_process,
+            shared_tensors_to_discard=getattr(
+                unwrapped, "_tied_weights_keys", None
+            ),
         )
 
-    if getattr(args, "enable_gradient_checkpointing", False):
+        torch.save(optimizer.state_dict(), tmp_dir / "optimizer.pt")
+
+        if save_dir.exists():
+            shutil.rmtree(save_dir)
+        tmp_dir.rename(save_dir)
+
+        accelerator.print(f"[dots_tts] Checkpoint saved: {save_dir}")
+    except Exception:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Training Initialization
+# ---------------------------------------------------------------------------
+
+
+def _initialize_training(args: argparse.Namespace) -> dict[str, Any]:
+    """Initialize model, dataset, optimizer, scheduler, and accelerator.
+
+    Returns a dict with all objects needed for the training loop.
+    """
+    # 1. Load params from JSON
+    params = load_training_params(args.params_file)
+    ns = params.to_namespace()
+
+    init_model_path = ns.init_model_path
+    output_model_path = ns.output_model_path
+    input_jsonl = getattr(ns, "input_jsonl", getattr(ns, "train_manifest", ""))
+    batch_size = int(getattr(ns, "batch_size", 1))
+    learning_rate = float(getattr(ns, "lr", 2e-5))
+    num_epochs = int(getattr(ns, "num_epochs", 5))
+    gradient_accumulation_steps = int(
+        getattr(ns, "gradient_accumulation_steps", 1)
+    )
+    device = getattr(ns, "device", "cuda")
+    logging_dir = getattr(ns, "logging_dir", output_model_path)
+    enable_grad_ckpt = bool(
+        getattr(ns, "enable_gradient_checkpointing", False)
+    )
+    warmup_steps = int(getattr(ns, "warmup_steps", 100))
+    grad_clip_norm = float(getattr(ns, "gradient_clip_norm", 1.0))
+    log_interval = int(getattr(ns, "log_interval", 10))
+    is_cpu = (device or "cpu").strip().lower() == "cpu"
+    mixed_precision = "bf16" if not is_cpu else "no"
+
+    print(f"[dots_tts] Training configuration:")
+    print(f"[dots_tts]   init_model_path={init_model_path}")
+    print(f"[dots_tts]   output_model_path={output_model_path}")
+    print(f"[dots_tts]   input_jsonl={input_jsonl}")
+    print(f"[dots_tts]   batch_size={batch_size}")
+    print(f"[dots_tts]   lr={learning_rate}")
+    print(f"[dots_tts]   num_epochs={num_epochs}")
+    print(f"[dots_tts]   gradient_accumulation_steps={gradient_accumulation_steps}")
+    print(f"[dots_tts]   device={device} is_cpu={is_cpu}")
+    print(f"[dots_tts]   enable_gradient_checkpointing={enable_grad_ckpt}")
+
+    # 2. Load model
+    model, tokenizer = load_model_for_training(init_model_path)
+    sample_rate = int(model.config.vocoder.sample_rate)
+
+    # 3. Gradient checkpointing
+    if enable_grad_ckpt:
         disable_use_cache_for_training(model)
         enable_gradient_checkpointing(model)
 
-    train_data, train_dataloader = build_train_dataloader(args)
-
-    num_epochs = int(getattr(args, "num_epochs", None) or 5)
-    num_batches_per_epoch = len(train_dataloader)
-    num_training_steps = num_epochs * num_batches_per_epoch
-
-    optimizer = build_optimizer(model, args, deps)
-    scheduler = build_scheduler(optimizer, args, num_training_steps)
-
-    model, optimizer, train_dataloader, scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, scheduler
+    # 4. Load dataset
+    dataset = DotsTtsInMemoryDataset(
+        input_jsonl,
+        tokenizer=tokenizer,
+        sample_rate=sample_rate,
     )
+
+    # 5. Build DataLoader
+    train_loader: torch.utils.data.DataLoader = build_train_dataloader(
+        dataset,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        num_workers=0,
+    )
+
+    num_batches_per_epoch = len(train_loader)
+    max_train_steps = num_epochs * num_batches_per_epoch
+
+    # 6. Build optimizer & scheduler
+    optimizer = build_optimizer(
+        model,
+        learning_rate=learning_rate,
+        weight_decay=0.1,
+    )
+    scheduler = build_scheduler(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max_train_steps,
+    )
+
+    # 7. Build accelerator
+    accelerator = build_accelerator(
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        output_dir=logging_dir,
+        mixed_precision=mixed_precision,
+        cpu=is_cpu,
+    )
+
+    # 8. Prepare with accelerator
+    model, optimizer, train_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, scheduler
+    )
+
+    unwrapped_model = accelerator.unwrap_model(model)
 
     accelerator.print(
-        f"[dots_tts] Training initialized: {runtime.mode_label}"
-    )
-    accelerator.print(
-        f"[dots_tts]   batches/epoch={num_batches_per_epoch} "
-        f"epochs={num_epochs} total_steps={num_training_steps}"
-    )
-
-    return TrainingPipelineContext(
-        runtime=runtime,
-        accelerator=accelerator,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        train_dataloader=train_dataloader,
-        train_data=train_data,
+        f"[dots_tts] Training initialized: "
+        f"batches/epoch={num_batches_per_epoch} "
+        f"epochs={num_epochs} "
+        f"total_steps={max_train_steps}"
     )
 
+    return {
+        "accelerator": accelerator,
+        "model": model,
+        "unwrapped_model": unwrapped_model,
+        "tokenizer": tokenizer,
+        "optimizer": optimizer,
+        "scheduler": scheduler,
+        "train_loader": train_loader,
+        "dataset": dataset,
+        "num_epochs": num_epochs,
+        "num_batches_per_epoch": num_batches_per_epoch,
+        "max_train_steps": max_train_steps,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "output_model_path": output_model_path,
+        "grad_clip_norm": grad_clip_norm,
+        "log_interval": log_interval,
+    }
 
-def run_training(
-    args: argparse.Namespace,
-    dependencies: SimpleNamespace | None = None,
-) -> None:
+
+# ---------------------------------------------------------------------------
+# Training Loop
+# ---------------------------------------------------------------------------
+
+
+def run_training(args: argparse.Namespace) -> None:
     """Execute the full fine-tuning pipeline.
 
-    This function orchestrates the end-to-end training process:
-    1. Initialize the model, optimizer, scheduler, and DataLoader.
-    2. Run the training loop across all epochs.
-    3. Save the final checkpoint.
-
-    The training loop uses the dots_tts model's native ``forward``,
-    which internally computes the flow-matching loss.
+    This is the main training orchestration function:
+    1. Initialize model, dataset, optimizer, scheduler, accelerator.
+    2. Run the training loop for the configured number of epochs.
+    3. Save epoch checkpoints.
     """
-    deps = dependencies or load_training_dependencies()
-    context = initialize_training_pipeline(args, deps)
+    ctx = _initialize_training(args)
 
-    accelerator = context.accelerator
-    model = context.model
-    optimizer = context.optimizer
-    scheduler = context.scheduler
-    train_dataloader = context.train_dataloader
+    accelerator: Accelerator = ctx["accelerator"]
+    model = ctx["model"]
+    unwrapped_model = ctx["unwrapped_model"]
+    optimizer = ctx["optimizer"]
+    scheduler = ctx["scheduler"]
+    train_loader = ctx["train_loader"]
+    num_epochs: int = ctx["num_epochs"]
+    num_batches_per_epoch: int = ctx["num_batches_per_epoch"]
+    max_train_steps: int = ctx["max_train_steps"]
+    gradient_accumulation_steps: int = ctx["gradient_accumulation_steps"]
+    output_model_path: str = ctx["output_model_path"]
+    grad_clip_norm: float = ctx["grad_clip_norm"]
+    log_interval: int = ctx["log_interval"]
 
-    num_epochs = int(getattr(args, "num_epochs", None) or 5)
-    gradient_clip_norm = float(
-        getattr(args, "gradient_clip_norm", None) or 1.0
-    )
-    log_interval = int(getattr(args, "log_interval", None) or 10)
-
-    model.train()
+    progress = TrainProgress()
     global_step = 0
 
+    # Track per-epoch loss for progress reporting
+    optimizer.zero_grad(set_to_none=True)
+    model.train()
+
     for epoch in range(num_epochs):
-        for step, batch in enumerate(train_dataloader):
+        epoch_loss_sum = 0.0
+        epoch_loss_count = 0
+        epoch_start_time = time.perf_counter()
+
+        for step, batch in enumerate(train_loader):
             with accelerator.accumulate(model):
-                # dots_tts forward pass: the model internally computes
-                # the flow-matching loss on audio + text pairs.
-                # The collate_fn returns {"fid", "audio", "text"} —
-                # the model expects audio paths / waveforms and text
-                # strings, and internally runs encode → LLM → acoustic.
-                outputs = model(
-                    audio=batch["audio"],
-                    text=batch["text"],
+                # Prepare batch for the model
+                prepared = unwrapped_model.prepare_training_batch(batch)
+
+                # Move to device
+                prepared = _move_to_device(prepared, accelerator.device)
+
+                # Forward pass produces loss_terms dict
+                loss_terms = model(prepared)
+
+                # Compute global normalizers from loss masks
+                from dots_tts.training.losses import (
+                    collapse_loss_masks,
+                    to_host_named_scalars,
+                    sum_named_scalars_across_ranks,
                 )
-                loss = outputs["loss"]
+
+                local_normalizers = to_host_named_scalars(
+                    collapse_loss_masks(prepared["loss_masks"])
+                )
+                global_normalizers = sum_named_scalars_across_ranks(
+                    local_normalizers,
+                )
+
+                # Compute gradient-scaled loss
+                loss = compute_loss(
+                    loss_terms,
+                    global_normalizers=global_normalizers,
+                    ddp_world_size=int(accelerator.num_processes),
+                    gradient_accumulation_steps=gradient_accumulation_steps,
+                )
 
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(
-                        model.parameters(), gradient_clip_norm
+                        model.parameters(), grad_clip_norm
                     )
-
-                optimizer.step()
-                if scheduler is not None:
+                    optimizer.step()
                     scheduler.step()
-                optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
 
+            loss_value = loss.detach().item()
+            epoch_loss_sum += loss_value
+            epoch_loss_count += 1
+
             if step % log_interval == 0:
-                lr_val = (
-                    scheduler.get_last_lr()[0]
-                    if scheduler is not None
-                    else float(getattr(args, "learning_rate", None) or 2e-5)
-                )
+                lr_val = scheduler.get_last_lr()[0]
                 accelerator.print(
-                    f"Epoch {epoch} | Step {step} | "
-                    f"Loss: {loss.item():.4f} | LR: {lr_val:.2e}"
+                    f"[dots_tts] Epoch {epoch} | Step {step}/{num_batches_per_epoch} | "
+                    f"Loss: {loss_value:.4f} | LR: {lr_val:.2e}"
                 )
 
+        epoch_elapsed = time.perf_counter() - epoch_start_time
+        epoch_avg_loss = epoch_loss_sum / max(epoch_loss_count, 1)
         accelerator.print(
             f"[dots_tts] Epoch {epoch} complete. "
-            f"Steps: {global_step}"
+            f"Avg loss: {epoch_avg_loss:.4f} | "
+            f"Time: {epoch_elapsed:.1f}s | "
+            f"Steps: {global_step}/{max_train_steps}"
         )
 
+        # Save checkpoint after each epoch
         if accelerator.is_main_process:
-            save_training_checkpoint(args, accelerator, model, epoch)
+            _save_training_checkpoint(
+                accelerator=accelerator,
+                model=model,
+                optimizer=optimizer,
+                output_dir=output_model_path,
+                epoch=epoch,
+                global_step=global_step,
+            )
 
-    accelerator.print("[dots_tts] Training complete.")
+    # Save final checkpoint
+    if accelerator.is_main_process:
+        accelerator.print(
+            f"[dots_tts] Training complete. "
+            f"Total steps: {global_step}. "
+            f"Saving final model..."
+        )
+        unwrapped_model.save_pretrained(
+            str(Path(output_model_path) / "final")
+        )
+        accelerator.print(
+            f"[dots_tts] Final model saved to "
+            f"{Path(output_model_path) / 'final'}"
+        )
+
+    accelerator.print("[dots_tts] Training completed successfully.")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _move_to_device(value: Any, device: torch.device) -> Any:
+    """Recursively move nested tensors/dicts/dataclasses to ``device``."""
+    from dataclasses import fields, is_dataclass
+
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {k: _move_to_device(v, device) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_move_to_device(v, device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(v, device) for v in value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return type(value)(
+            **{
+                f.name: _move_to_device(getattr(value, f.name), device)
+                for f in fields(value)
+            }
+        )
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Entry Points
+# ---------------------------------------------------------------------------
 
 
 def train(argv: list[str] | None = None) -> None:
-    """CLI entry point for training."""
+    """CLI entry point — parse args, load params, run training."""
     cli_args = parse_args(argv)
-    params = load_training_params(cli_args.params_file)
-    run_training(params.to_namespace())
+    run_training(cli_args)
 
 
 if __name__ == "__main__":
