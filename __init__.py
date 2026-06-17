@@ -1,20 +1,10 @@
-from __future__ import annotations
+"""kirine-client dots_tts script project.
 
-import sys
-from pathlib import Path
+This directory is loaded under the alias ``kirine_dots_tts`` (see
+``_bootstrap.py``) so that it does not shadow the official ``dots_tts``
+runtime library installed in the environment via ``pip install -e``.
 
-
-def ensure_src_root_on_path() -> Path:
-    """Ensure the ``src-model/`` directory is on ``sys.path``.
-
-    This allows scripts inside ``dots_tts/`` to import the installed
-    ``dots_tts`` runtime package as well as sibling model packages.
-    """
-    src_root = Path(__file__).resolve().parents[1]
-    src_root_str = str(src_root)
-    if src_root_str not in sys.path:
-        sys.path.insert(0, src_root_str)
-    return src_root
-
-
-ensure_src_root_on_path()
+Script-project helper modules (``common``, ``params``, ``dataset``,
+``training_common``) are imported as ``kirine_dots_tts.xxx``.  Imports of
+``dots_tts.xxx`` always resolve to the installed library.
+"""

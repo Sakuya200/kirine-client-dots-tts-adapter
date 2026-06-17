@@ -9,8 +9,8 @@ numpy==2.2.6
 pydantic==2.12.5
 PyYAML==6.0.3
 safetensors==0.8.0rc0
-modelscope==1.0.0
-huggingface_hub==1.19.0
+modelscope
+huggingface_hub
 
 # Optional `full` extra.
 accelerate==1.12.0

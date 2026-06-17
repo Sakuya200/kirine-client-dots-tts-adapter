@@ -9,14 +9,13 @@ from typing import Any
 import torch
 from accelerate import Accelerator
 
-from dots_tts import ensure_src_root_on_path
+import _bootstrap
+_bootstrap.setup()
 
-ensure_src_root_on_path()
-
-from dots_tts.common import load_model_for_training  # noqa: E402
-from dots_tts.dataset import DotsTtsInMemoryDataset  # noqa: E402
-from dots_tts.params import load_training_params  # noqa: E402
-from dots_tts.training_common import (  # noqa: E402
+from kirine_dots_tts.common import load_model_for_training  # noqa: E402
+from kirine_dots_tts.dataset import DotsTtsInMemoryDataset  # noqa: E402
+from kirine_dots_tts.params import load_training_params  # noqa: E402
+from kirine_dots_tts.training_common import (  # noqa: E402
     TrainProgress,
     add_common_training_args,
     build_accelerator,

@@ -3,7 +3,7 @@ from __future__ import annotations
 from argparse import Namespace
 from dataclasses import dataclass
 from pathlib import Path
-from params_entity import CommonTaskArgs, ParamsEntity, RuntimeOptions
+from .params_entity import CommonTaskArgs, ParamsEntity, RuntimeOptions
 
 
 DOTS_TTS_INFERENCE_MODEL_NAME = "dots.tts-soar"
@@ -63,7 +63,7 @@ def _resolve_locator_candidate(
     if leaf_name is None:
         return None
 
-    return str((root_path / leaf_name).resolve())
+    return str((root_path / "models" / leaf_name).resolve())
 
 
 def _require_resolved_path(path: str | None, label: str) -> str:

@@ -27,7 +27,7 @@ def ensure_src_root_on_path() -> None:
 def load_runtime(
     model_path: str,
     *,
-    precision: str = "bfloat16",
+    precision: str = "float32",
     optimize: bool = False,
     max_generate_length: int = 500,
 ) -> Any:
@@ -52,7 +52,7 @@ def load_runtime(
     print(f"[dots_tts]   precision={precision} optimize={optimize}")
 
     runtime = DotsTtsRuntime.from_pretrained(
-        str(resolved),
+        model_name_or_path=str(resolved),
         precision=precision,
         optimize=optimize,
         max_generate_length=max_generate_length,
@@ -79,7 +79,7 @@ def load_model_for_training(
     resolved = Path(model_path).expanduser().resolve()
     print(f"[dots_tts] Loading training model from: {resolved}")
 
-    model = DotsTtsModel.from_pretrained(str(resolved))
+    model = DotsTtsModel.from_pretrained(model_name_or_path=str(resolved))
     tokenizer = model.tokenizer
 
     total_params = sum(p.numel() for p in model.parameters())

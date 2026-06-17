@@ -3,12 +3,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from dots_tts import ensure_src_root_on_path
+import _bootstrap
+_bootstrap.setup()
 
-ensure_src_root_on_path()
-
-from dots_tts.common import load_runtime, save_generated_audio  # noqa: E402
-from dots_tts.params import load_voice_clone_params  # noqa: E402
+from kirine_dots_tts.common import load_runtime, save_generated_audio  # noqa: E402
+from kirine_dots_tts.params import load_voice_clone_params  # noqa: E402
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
