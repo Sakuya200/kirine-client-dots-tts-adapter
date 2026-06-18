@@ -133,11 +133,13 @@ def _mount_project(target_root: Path, target_dir: Path, base_model: str) -> None
             subprocess.run(
                 ["conda", "install", "--prefix", str(conda_env_path), "-y", "-c", "conda-forge", "pynini"],
                 check=True,
+                shell=True
             )
             
             subprocess.run(
                 ["conda", "run", "--prefix", str(conda_env_path), "pip", "install", "-e", str(target_dir)],
                 check=True,
+                shell=True
             )
         except subprocess.CalledProcessError as e:
             raise SystemExit(
