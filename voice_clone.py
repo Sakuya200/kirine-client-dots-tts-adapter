@@ -69,7 +69,12 @@ def generate_audio(args: argparse.Namespace) -> None:
     )
     print(f"[dots_tts] Clone mode: {mode_label}")
 
-    runtime = load_runtime(args.init_model_path)
+    runtime = load_runtime(
+        args.init_model_path,
+        precision=getattr(args, "precision", "float32") or "float32",
+        optimize=bool(getattr(args, "optimize", False)),
+        max_generate_length=int(getattr(args, "max_generate_length", 500) or 500),
+    )
 
     generate_kwargs: dict = {
         "text": text,

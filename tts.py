@@ -42,7 +42,12 @@ def generate_audio(args: argparse.Namespace) -> None:
         f"language={language}"
     )
 
-    runtime = load_runtime(args.init_model_path)
+    runtime = load_runtime(
+        args.init_model_path,
+        precision=getattr(args, "precision", "float32") or "float32",
+        optimize=bool(getattr(args, "optimize", False)),
+        max_generate_length=int(getattr(args, "max_generate_length", 500) or 500),
+    )
 
     result = runtime.generate(
         text=text,

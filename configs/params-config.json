@@ -41,6 +41,47 @@
         "required": true,
         "defaultValue": "1.5",
         "description": "说话人 embedding 缩放系数。控制音色匹配强度。"
+      },
+      {
+        "name": "precision",
+        "type": "string",
+        "componentType": "select",
+        "componentProps": {
+          "label": "推理精度",
+          "options": [
+            { "label": "bfloat16", "value": "bfloat16" },
+            { "label": "float16", "value": "float16" },
+            { "label": "float32", "value": "float32" }
+          ]
+        },
+        "required": true,
+        "defaultValue": "float32",
+        "description": "模型加载与推理的计算精度。bfloat16 显存占用最低、速度最快，推荐支持 BF16 的 NVIDIA 显卡（如 RTX 30/40 系及以上）；float16 适合不支持 BF16 的显卡；float32 精度最高但显存占用与耗时显著增加。CPU 仅建议使用 float32。"
+      },
+      {
+        "name": "optimize",
+        "type": "boolean",
+        "componentType": "switch",
+        "componentProps": {
+          "label": "torch.compile 加速",
+          "text": "启用 torch.compile 加速"
+        },
+        "required": true,
+        "defaultValue": false,
+        "description": "启用 torch.compile 对模型加速。首次推理需额外编译耗时，之后单次推理速度提升；显存占用与兼容性要求更高，若遇到编译报错或显存不足可关闭。"
+      },
+      {
+        "name": "maxGenerateLength",
+        "type": "number",
+        "componentType": "input-number",
+        "componentProps": {
+          "label": "最大生成长度",
+          "min": 1,
+          "step": 1
+        },
+        "required": true,
+        "defaultValue": 500,
+        "description": "单次生成的最大音频 patch 数，约等于可合成音频长度的上限。值越大可生成的音频越长，但显存占用与推理耗时随之增加；文本较短时无需调大。"
       }
     ]
   },
@@ -86,6 +127,47 @@
         "required": true,
         "defaultValue": "1.5",
         "description": "说话人 embedding 缩放系数。控制音色匹配强度。"
+      },
+      {
+        "name": "precision",
+        "type": "string",
+        "componentType": "select",
+        "componentProps": {
+          "label": "推理精度",
+          "options": [
+            { "label": "bfloat16", "value": "bfloat16" },
+            { "label": "float16", "value": "float16" },
+            { "label": "float32", "value": "float32" }
+          ]
+        },
+        "required": true,
+        "defaultValue": "float32",
+        "description": "模型加载与推理的计算精度。bfloat16 显存占用最低、速度最快，推荐支持 BF16 的 NVIDIA 显卡（如 RTX 30/40 系及以上）；float16 适合不支持 BF16 的显卡；float32 精度最高但显存占用与耗时显著增加。CPU 仅建议使用 float32。"
+      },
+      {
+        "name": "optimize",
+        "type": "boolean",
+        "componentType": "switch",
+        "componentProps": {
+          "label": "torch.compile 加速",
+          "text": "启用 torch.compile 加速"
+        },
+        "required": true,
+        "defaultValue": false,
+        "description": "启用 torch.compile 对模型加速。首次推理需额外编译耗时，之后单次推理速度提升；显存占用与兼容性要求更高，若遇到编译报错或显存不足可关闭。"
+      },
+      {
+        "name": "maxGenerateLength",
+        "type": "number",
+        "componentType": "input-number",
+        "componentProps": {
+          "label": "最大生成长度",
+          "min": 1,
+          "step": 1
+        },
+        "required": true,
+        "defaultValue": 500,
+        "description": "单次生成的最大音频 patch 数，约等于可合成音频长度的上限。值越大可生成的音频越长，但显存占用与推理耗时随之增加；文本较短时无需调大。"
       }
     ]
   },

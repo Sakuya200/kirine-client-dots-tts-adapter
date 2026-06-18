@@ -105,6 +105,19 @@ def _normalize_runtime(runtime: RuntimeOptions) -> RuntimeOptions:
     )
 
 
+def _load_runtime_build_params(params: ParamsEntity) -> tuple[str, bool, int]:
+    """Read ``precision``/``optimize``/``maxGenerateLength`` model params.
+
+    These configure :func:`kirine_dots_tts.common.load_runtime` (i.e. the
+    underlying ``DotsTtsRuntime.from_pretrained`` constructor). They default to
+    the same values the runtime library itself uses when omitted.
+    """
+    precision = params.model_param_str("precision", "float32") or "float32"
+    optimize = params.model_param_bool("optimize", False)
+    max_generate_length = params.model_param_int("maxGenerateLength", 500) or 500
+    return precision, optimize, max_generate_length
+
+
 def _resolve_dots_tts_inference_model_path(
     params: ParamsEntity,
 ) -> str:
@@ -176,6 +189,9 @@ class DotsTtsParams:
     num_steps: int
     guidance_scale: float
     speaker_scale: float
+    precision: str
+    optimize: bool
+    max_generate_length: int
     runtime: RuntimeOptions
 
     def to_namespace(self) -> Namespace:
@@ -189,6 +205,9 @@ class DotsTtsParams:
             num_steps=self.num_steps,
             guidance_scale=self.guidance_scale,
             speaker_scale=self.speaker_scale,
+            precision=self.precision,
+            optimize=self.optimize,
+            max_generate_length=self.max_generate_length,
             logging_dir=self.runtime.logging_dir,
             device=self.runtime.device,
             attn_implementation=self.runtime.attn_implementation,
@@ -207,6 +226,9 @@ class DotsTtsVoiceCloneParams:
     num_steps: int
     guidance_scale: float
     speaker_scale: float
+    precision: str
+    optimize: bool
+    max_generate_length: int
     runtime: RuntimeOptions
 
     def to_namespace(self) -> Namespace:
@@ -220,6 +242,9 @@ class DotsTtsVoiceCloneParams:
             num_steps=self.num_steps,
             guidance_scale=self.guidance_scale,
             speaker_scale=self.speaker_scale,
+            precision=self.precision,
+            optimize=self.optimize,
+            max_generate_length=self.max_generate_length,
             logging_dir=self.runtime.logging_dir,
             device=self.runtime.device,
             attn_implementation=self.runtime.attn_implementation,
@@ -252,6 +277,7 @@ class DotsTtsVoiceDesignParams:
 def load_tts_params(path: str | Path) -> DotsTtsParams:
     params = ParamsEntity.from_file(path)
     args = params.tts_args()
+    precision, optimize, max_generate_length = _load_runtime_build_params(params)
 
     return DotsTtsParams(
         common=args.common,
@@ -264,6 +290,9 @@ def load_tts_params(path: str | Path) -> DotsTtsParams:
         num_steps=int(params.model_param("numSteps", 10) or 10),
         guidance_scale=float(params.model_param("guidanceScale", "1.2") or 1.2),
         speaker_scale=float(params.model_param("speakerScale", "1.5") or 1.5),
+        precision=precision,
+        optimize=optimize,
+        max_generate_length=max_generate_length,
         runtime=_normalize_runtime(params.runtime),
     )
 
@@ -271,6 +300,7 @@ def load_tts_params(path: str | Path) -> DotsTtsParams:
 def load_voice_clone_params(path: str | Path) -> DotsTtsVoiceCloneParams:
     params = ParamsEntity.from_file(path)
     args = params.voice_clone_args()
+    precision, optimize, max_generate_length = _load_runtime_build_params(params)
 
     return DotsTtsVoiceCloneParams(
         common=args.common,
@@ -283,5 +313,8 @@ def load_voice_clone_params(path: str | Path) -> DotsTtsVoiceCloneParams:
         num_steps=int(params.model_param("numSteps", 10) or 10),
         guidance_scale=float(params.model_param("guidanceScale", "1.2") or 1.2),
         speaker_scale=float(params.model_param("speakerScale", "1.5") or 1.5),
+        precision=precision,
+        optimize=optimize,
+        max_generate_length=max_generate_length,
         runtime=_normalize_runtime(params.runtime),
     )
